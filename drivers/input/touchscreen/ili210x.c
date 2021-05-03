@@ -274,6 +274,7 @@ static const struct ili2xxx_chip ili251x_chip = {
 static bool ili210x_report_events(struct ili210x *priv, u8 *touchdata)
 {
 	struct input_dev *input = priv->input;
+	struct i2c_client *client = priv->client;
 	int i;
 	bool contact = false, touch;
 	unsigned int x = 0, y = 0, z = 0;
@@ -287,6 +288,8 @@ static bool ili210x_report_events(struct ili210x *priv, u8 *touchdata)
 			if (priv->chip->has_pressure_reg)
 				input_report_abs(input, ABS_MT_PRESSURE, z);
 			contact = true;
+			dev_err(&client->dev,
+				"ili210x_report_events i: %d x: %d y: %d\n", i, x, y);
 		}
 	}
 
@@ -313,6 +316,9 @@ static irqreturn_t ili210x_irq(int irq, void *irq_data)
 				"Unable to get touch data: %d\n", error);
 			break;
 		}
+
+		dev_err(&client->dev,
+			"ili210x_irq touch data: %d\n", touchdata);
 
 		touch = ili210x_report_events(priv, touchdata);
 		keep_polling = chip->continue_polling(touchdata, touch);
