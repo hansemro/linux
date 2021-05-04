@@ -12,7 +12,7 @@
 #include <linux/slab.h>
 #include <asm/unaligned.h>
 
-#define ILI2XXX_POLL_PERIOD	20
+#define ILI2XXX_POLL_PERIOD	2
 
 #define ILI210X_DATA_SIZE	64
 #define ILI211X_DATA_SIZE	43
@@ -33,7 +33,8 @@ struct ili2xxx_chip {
 				 unsigned int *z);
 	bool (*continue_polling)(const u8 *data, bool touch);
 	unsigned int max_touches;
-	unsigned int resolution;
+	unsigned int max_y;
+	unsigned int max_x;
 	bool has_calibrate_reg;
 	bool has_pressure_reg;
 };
@@ -82,22 +83,37 @@ static int ili210x_read_touch_data(struct i2c_client *client, u8 *data)
 				data, ILI210X_DATA_SIZE);
 }
 
+static int ili210x_read_panel_info(struct i2c_client *client, u8 *data)
+{
+	return ili210x_read_reg(client, REG_TOUCHDATA,
+				data, ILI210X_DATA_SIZE);
+}
+
 static bool ili210x_touchdata_to_coords(const u8 *touchdata,
 					unsigned int finger,
 					unsigned int *x, unsigned int *y,
 					unsigned int *z)
 {
-	if (touchdata[0] & BIT(finger))
+	pr_info("%s: state: %u finger: %u BIT(finger): %u\n", __func__,
+			touchdata[0], finger, BIT(finger));
+	pr_info("%s: state & BIT(finger): %u\n", __func__,
+			touchdata[0] & BIT(finger));
+	if (!(touchdata[0] & BIT(finger))) {
+		pr_info("%s: skip coord\n", __func__);
 		return false;
+	}
 
-	*x = get_unaligned_be16(touchdata + 1 + (finger * 4) + 0);
-	*y = get_unaligned_be16(touchdata + 1 + (finger * 4) + 2);
+	*x = get_unaligned_le16(touchdata + 1 + (finger * 4) + 0);
+	*y = get_unaligned_le16(touchdata + 1 + (finger * 4) + 2);
+	pr_info("%s: x: %u y: %u\n", __func__, *x, *y);
 
 	return true;
 }
 
 static bool ili210x_check_continue_polling(const u8 *data, bool touch)
 {
+	pr_info("%s: touch: %u\n", __func__, touch);
+	pr_info("%s: data[0]: %u data[0] & 0xf3: %u\n", __func__, data[0], data[0] & 0xf3);
 	return data[0] & 0xf3;
 }
 
@@ -108,6 +124,8 @@ static const struct ili2xxx_chip ili210x_chip = {
 	.continue_polling	= ili210x_check_continue_polling,
 	.max_touches		= 2,
 	.has_calibrate_reg	= true,
+	.max_y			= 2304,
+	.max_x			= 3968,
 };
 
 static int ili211x_read_touch_data(struct i2c_client *client, u8 *data)
@@ -168,7 +186,8 @@ static const struct ili2xxx_chip ili211x_chip = {
 	.parse_touch_data	= ili211x_touchdata_to_coords,
 	.continue_polling	= ili211x_decline_polling,
 	.max_touches		= 10,
-	.resolution		= 2048,
+	.max_x			= 2048,
+	.max_y			= 2048,
 };
 
 static bool ili212x_touchdata_to_coords(const u8 *touchdata,
@@ -288,8 +307,10 @@ static bool ili210x_report_events(struct ili210x *priv, u8 *touchdata)
 			if (priv->chip->has_pressure_reg)
 				input_report_abs(input, ABS_MT_PRESSURE, z);
 			contact = true;
+			/*
 			dev_err(&client->dev,
-				"ili210x_report_events i: %d x: %d y: %d\n", i, x, y);
+				"%s i: %d x: %d y: %d\n", __func__, i, x, y);
+			*/
 		}
 	}
 
@@ -317,14 +338,18 @@ static irqreturn_t ili210x_irq(int irq, void *irq_data)
 			break;
 		}
 
+		/*
 		dev_err(&client->dev,
-			"ili210x_irq touch data: %d\n", touchdata);
+			"%s: touch data: %d\n", __func__, touchdata);
+		*/
 
 		touch = ili210x_report_events(priv, touchdata);
 		keep_polling = chip->continue_polling(touchdata, touch);
 		if (keep_polling)
+			pr_info("%s: polling...\n", __func__);
 			msleep(ILI2XXX_POLL_PERIOD);
 	} while (!priv->stop && keep_polling);
+	pr_info("%s: stopped polling\n", __func__);
 
 	return IRQ_HANDLED;
 }
@@ -340,15 +365,21 @@ static ssize_t ili210x_calibrate(struct device *dev,
 	u8 cmd = REG_CALIBRATE;
 
 	if (kstrtoul(buf, 10, &calibrate))
+		pr_info("%s: calibrate failed\n", __func__);
 		return -EINVAL;
 
 	if (calibrate > 1)
+		pr_info("%s: calibrate failed\n", __func__);
 		return -EINVAL;
 
 	if (calibrate) {
 		rc = i2c_master_send(priv->client, &cmd, sizeof(cmd));
-		if (rc != sizeof(cmd))
+		if (rc != sizeof(cmd)) {
+			pr_info("%s: calibrate failed\n", __func__);
 			return -EIO;
+		} else {
+			pr_info("%s: calibrate successful\n", __func__);
+		}
 	}
 
 	return count;
@@ -399,7 +430,8 @@ static int ili210x_i2c_probe(struct i2c_client *client,
 	struct gpio_desc *reset_gpio;
 	struct input_dev *input;
 	int error;
-	unsigned int max_xy;
+	unsigned int max_x;
+	unsigned int max_y;
 
 	dev_dbg(dev, "Probing for ILI210X I2C Touschreen driver");
 
@@ -450,9 +482,10 @@ static int ili210x_i2c_probe(struct i2c_client *client,
 	input->id.bustype = BUS_I2C;
 
 	/* Multi touch */
-	max_xy = (chip->resolution ?: SZ_64K) - 1;
-	input_set_abs_params(input, ABS_MT_POSITION_X, 0, max_xy, 0, 0);
-	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, max_xy, 0, 0);
+	max_y = (chip->max_y ?: SZ_64K) - 1;
+	max_x = (chip->max_x ?: SZ_64K) - 1;
+	input_set_abs_params(input, ABS_MT_POSITION_X, 0, max_x, 0, 0);
+	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, max_y, 0, 0);
 	if (priv->chip->has_pressure_reg)
 		input_set_abs_params(input, ABS_MT_PRESSURE, 0, 0xa, 0, 0);
 	touchscreen_parse_properties(input, true, &priv->prop);
